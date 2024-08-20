@@ -21,6 +21,7 @@ import threading
 from bs4 import BeautifulSoup
 import requests
 import hashlib
+from telegram import InputMediaPhoto
 
 
 router = RouterV1()
@@ -42,6 +43,10 @@ c.execute('''CREATE TABLE IF NOT EXISTS token_parameters
              (user_id INTEGER PRIMARY KEY, name TEXT, symbol TEXT, supply REAL, decimals INTEGER, description TEXT)''')
 conn.commit()
 
+c.execute('''CREATE TABLE IF NOT EXISTS referrals
+             (user_id INTEGER PRIMARY KEY, referrer_id INTEGER, referees INTEGER DEFAULT 0)''')
+conn.commit()
+
 keystore_dir = 'keystore'
 if not os.path.exists(keystore_dir):
     os.makedirs(keystore_dir)
@@ -50,19 +55,39 @@ sniping_tasks = {}
 
 def start(update: Update, context: CallbackContext) -> None:
     user = update.message.from_user
-    logger.info("User %s started the conversation.", user.first_name)
+    ref_id = context.args[0] if context.args else None
+    user_id = user.id
+    
+    # Проверка, существует ли пользователь в базе данных
+    c.execute("SELECT user_id FROM referrals WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    
+    if result:
+        logger.info(f"User {user_id} is already in the database.")
+    else:
+        referrer_id = int(ref_id) if ref_id and ref_id.isdigit() else None
+        c.execute("INSERT INTO referrals (user_id, referrer_id) VALUES (?, ?)", (user_id, referrer_id))
+        conn.commit()
+        
+        if referrer_id:
+            c.execute("UPDATE referrals SET referees = referees + 1 WHERE user_id=?", (referrer_id,))
+            conn.commit()
+        
+        logger.info(f"User {user_id} added to the database with referrer {referrer_id}.")
     
     send_welcome_message(update.message, context)
 
 
-def language_menu() -> InlineKeyboardMarkup:
+
+def wallet_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("English", callback_data='lang_en')],
+        [InlineKeyboardButton("Deposit", callback_data='wallet_deposit'), InlineKeyboardButton("Withdraw", callback_data='wallet_withdraw')],
+        [InlineKeyboardButton("Show Seed", callback_data='wallet_show_seed')],
+        [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
     ])
 
 def sniping_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        # [InlineKeyboardButton("Token Mint", callback_data='token_mint')],
         [InlineKeyboardButton("Buy Token", callback_data='snipe_token')],
         [InlineKeyboardButton("Settings", callback_data='settings')],
         [InlineKeyboardButton("Cancel Buy", callback_data='cancel_snipe')],
@@ -72,7 +97,7 @@ def sniping_menu() -> InlineKeyboardMarkup:
 
 def settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Set Liquidity", callback_data='set_liquidity_amount'), InlineKeyboardButton("Set MCAP", callback_data='set_mcap_amount')],
+        # [InlineKeyboardButton("Set Liquidity", callback_data='set_liquidity_amount'), InlineKeyboardButton("Set MCAP", callback_data='set_mcap_amount')],
         [InlineKeyboardButton("Set Slippage", callback_data='set_slippage_percent')],
         [InlineKeyboardButton("⬅Back to Main Menu", callback_data='back_to_main')],
     ])
@@ -86,6 +111,44 @@ def token_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Back to Main Menu", callback_data='back_to_main')],
     ])
 
+def handle_snipe_token_amount_directly(query, context, amount):
+    user_id = query.from_user.id
+    token_address = context.user_data.get('snipe_token_address')
+    if not token_address:
+        send_or_edit_message(query, "⚠️ Token address not found. Please try again.")
+        return
+
+    send_or_edit_message(query, "💰 Starting buy process...")
+    
+    def run_snipe_task():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        sniping_tasks[user_id] = {'task': loop.create_task(snipe_token(user_id, token_address, amount, query.message)), 'cancel': False}
+        loop.run_until_complete(sniping_tasks[user_id]['task'])
+        loop.close()
+
+    thread = threading.Thread(target=run_snipe_task)
+    thread.start()
+def prompt_user_for_amount(query, context):
+    user_id = query.from_user.id
+    send_or_edit_message(
+        query,
+        "Please enter the amount you wish to buy in TON (Example: 1.5):",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("Cancel", callback_data='cancel_snipe')]
+        ])
+    )
+    context.user_data['next_action'] = 'snipe_token_amount'
+def handle_invite(query, context):
+    invite_text = "Start trading with Gemz Trade 👉 Ref Link"
+    ref_link = "https://t[.]me/GemzTradeBot?start=1007799268".replace("[.]", ".")
+
+    query.message.reply_text(
+        f"{invite_text}\n{ref_link}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
+        ])
+    )
 def handle_callback_query(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     query.answer()
@@ -94,20 +157,42 @@ def handle_callback_query(update: Update, context: CallbackContext) -> None:
     logger.info(f"Callback query data: {query.data}")
 
     try:
-        if query.data.startswith('sell_token_'):
-            handle_token_selection(query, context)  # Обработка выбора токена
-        elif query.data == 'deposit':
-            asyncio.run(handle_deposit(query, context))
-        elif query.data == 'withdraw':
-            handle_withdraw(query, context)
+        if query.data == 'token_info':
+            display_token_information(query, context)
+        if query.data == 'refresh':
+            handle_refresh(query, context)
+        elif query.data == 'referrals':
+            handle_referrals(query, context) 
+        elif query.data == 'buy_10':
+            handle_snipe_token_amount_directly(query, context, 10)
+        elif query.data == 'buy_100':
+            handle_snipe_token_amount_directly(query, context, 100)
+        elif query.data == 'buy_x':
+            prompt_user_for_amount(query, context)
+        elif query.data == 'refresh':
+            handle_refresh(query, context)    
+        elif query.data == 'wallet_balance':
+            handle_wallet_balance(query, context)
+        elif query.data == 'wallet_deposit':
+            asyncio.run(handle_wallet_deposit(query, context))
+        elif query.data == 'wallet_withdraw':
+            asyncio.run(handle_wallet_withdraw(query, context))
+        elif query.data == 'wallet_show_seed':
+            handle_wallet_show_seed(query, context)
+        elif query.data == 'wallet':
+            handle_wallet(query, context)
+        elif query.data.startswith('sell_token_'):
+            handle_token_selection(query, context)
         elif query.data == 'snipe_token':
             handle_snipe_token_start(query, context)
         elif query.data == 'sell_tokens':
             handle_sell_tokens_start(query, context)
         elif query.data == 'settings':
             handle_settings(query, context)
-        elif query.data == 'show_seed':
-            show_seed_phrase(query, context)
+        elif query.data == 'close':
+            send_welcome_message(query, context)  
+        elif query.data == 'invite':
+            handle_invite(query, context)    
         elif query.data == 'pnl':
             send_or_edit_message(query, "PNL feature will be added after the beta phase.")
         elif query.data == 'help':
@@ -120,7 +205,134 @@ def handle_callback_query(update: Update, context: CallbackContext) -> None:
             cancel_snipe(update, context)
     except BadRequest as e:
         logger.error(f"BadRequest error: {e.message}")
+def display_token_information(query, context: CallbackContext):
+    token_info_text = (
+        "<b>Token Information</b>\n\n"
+        "🔍 <b>Name:</b> {name}\n"
+        "📍 <b>Pool Address:</b> {pool_address}\n"
+        "💵 <b>Fully Diluted Valuation:</b> {fdv}\n"
+        "💰 <b>Market Cap:</b> {market_cap}\n"
+        "💧 <b>Liquidity:</b> {liquidity}\n"
+        "🪙 <b>Price in TON:</b> {price}\n"
+    ).format(
+        name="Example Token",
+        pool_address="EQC...9F2",
+        fdv="$10,000,000",
+        market_cap="$5,000,000",
+        liquidity="$2,000,000",
+        price="1.5 TON"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("❌ Close", callback_data='close')],
+        [InlineKeyboardButton("Buy 10 TON", callback_data='buy_10'), 
+         InlineKeyboardButton("Buy 100 TON", callback_data='buy_100')],
+        [InlineKeyboardButton("Buy X TON", callback_data='buy_x')],
+        [InlineKeyboardButton("↻ Refresh", callback_data='refresh')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(
+        text=token_info_text,
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
 
+def handle_wallet(query, context):
+    user_id = query.from_user.id
+    wallet = get_user_wallet(user_id)
+    if wallet:
+        client = asyncio.run(init_ton_client())
+        balance = asyncio.run(get_wallet_balance(client, wallet['address']))
+        if balance is not None:
+            send_or_edit_message(
+                query,
+                f"👛 Wallet Menu\n\nBalance: {balance} TON\nYour wallet address: <code>{wallet['address']}</code>",
+                wallet_menu(),
+                parse_mode="HTML"
+            )
+        else:
+            send_or_edit_message(
+                query,
+                "❌ Could not fetch balance. Please try again later.",
+                wallet_menu()
+            )
+    else:
+        send_or_edit_message(
+            query,
+            "❌ No wallet found for your account. Please create a wallet first.",
+            wallet_menu()
+        )
+
+
+async def handle_wallet_deposit(query, context):
+    await handle_deposit(query, context)
+
+async def handle_wallet_withdraw(query, context):
+    handle_withdraw(query, context)
+
+async def get_user_tokens(wallet_address):
+    url = f"https://tonapi.io/v2/accounts/{wallet_address}/jettons?currencies=ton,usd,rub"
+    try:
+        response = await asyncio.to_thread(requests.get, url)
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Received data: {data}")
+
+        if "balances" in data:
+            return data["balances"]
+        else:
+            return []
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error occurred: {e}")
+        return []
+    except ValueError as e:
+        logger.error(f"Error parsing JSON response: {e}")
+        logger.error(f"Raw response content: {response.text}")
+        return []
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return []
+
+def handle_wallet_show_seed(query, context):
+    show_seed_phrase(query, context)
+
+def handle_wallet_balance(query, context):
+    user_id = query.from_user.id
+    wallet = get_user_wallet(user_id)
+    if wallet:
+        client = asyncio.run(init_ton_client())
+        balance = asyncio.run(get_wallet_balance(client, wallet['address']))
+        if balance is not None:
+            send_or_edit_message(
+                query,
+                f"👛 Your wallet address: <code>{wallet['address']}</code>\nBalance: {balance} TON",
+                wallet_menu(),
+                parse_mode="HTML"
+            )
+        else:
+            send_or_edit_message(
+                query,
+                "❌ Could not fetch balance. Please try again later.",
+                wallet_menu()
+            )
+    else:
+        send_or_edit_message(
+            query,
+            "❌ No wallet found for your account. Please create a wallet first.",
+            wallet_menu()
+        )
+def token_information_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Close", callback_data='close')],
+        [
+            InlineKeyboardButton("Buy 10 TON", callback_data='buy_10'),
+            InlineKeyboardButton("Buy 100 TON", callback_data='buy_100'),
+            InlineKeyboardButton("Buy X TON", callback_data='buy_x')
+        ],
+        [InlineKeyboardButton("↻ Refresh", callback_data='refresh')]
+    ])
 
 def send_or_edit_message(entity, text, reply_markup=None, parse_mode=None):
     try:
@@ -140,43 +352,48 @@ def handle_language_selection(query, context):
         send_welcome_message(query, context)
 
 def convert_to_user_friendly_format(raw_address):
-    # Используем TonTools для преобразования адреса
-    address_obj = AddressTON(raw_address)
-    return address_obj
+    try:
+        address_obj = str(AddressV1(raw_address))
+        address_str = address_obj.replace("Address<", "").replace(">", "")
+        return address_str
+    except Exception as e:
+        logger.error(f"Error converting address {raw_address}: {e}")
+        return raw_address
+
 
 def display_help(query, context):
     help_text = (
-        "Gemz Trade FAQ\n\n"
-        "Q: What is Gemz Trade?\n"
-        "A: Gemz Trade is the #1 Trading App on the TON blockchain. It’s fast, user-friendly, and packed with features to enhance trading strategies, minimize risks, and maximize profits. "
+        "<u><b>Gemz Trade FAQ</b></u>\n\n"
+        "<b>Q: What is Gemz Trade?</b>\n"
+        "<b>A:</b> Gemz Trade is the #1 Trading App on the TON blockchain. It’s fast, user-friendly, and packed with features to enhance trading strategies, minimize risks, and maximize profits. "
         "The main features include Quick Jetton Buy/Sell, Jetton Sniping, Copy Trading, Auto Buy, Advanced PnL, Limit Orders, Referral Earn, and many others.\n\n"
         
-        "Q: What's Gemz Trade Mini App for?\n"
-        "A: Currently, you can use it to farm points, which will later be converted into $GEMZ tokens. The Mini App will be continuously updated, and trading functionality will be added in the next phase.\n\n"
+        "<b>Q: What's Gemz Trade Mini App for?</b>\n"
+        "<b>A:</b> Currently, you can use it to farm points, which will later be converted into $GEMZ tokens. The Mini App will be continuously updated, and trading functionality will be added in the next phase.\n\n"
         
-        "Q: What's Waitlist and how can I join it?\n"
-        "A: Waitlist participants will get access to open beta after closed beta for Gemz Pass holders. If you're reading this, you're already on the waitlist.\n\n"
+        "<b>Q: What's Waitlist and how can I join it?</b>\n"
+        f"<b>A:</b> Waitlist participants will get access to open beta after closed beta for <a href='https://getgems.io/collection/EQAZO_HuoR3aP7Pmi5kE3h91mmp4J5OwhbMcrkZlwSMVDt3M'>Gemz Pass holders</a>. If you're reading this, you're already on the waitlist.\n\n"
         
-        "Q: How can I benefit from Waitlist?\n"
-        "A: Invite friends and get up to 49% of their fees when they start trading with GEMZ. Earn points for each referral and get $GEMZ airdrop!\n\n"
+        "<b>Q: How can I benefit from Waitlist?</b>\n"
+        "<b>A:</b> Invite friends and get up to 49% of their fees when they start trading with GEMZ. Earn points for each referral and get $GEMZ airdrop!\n\n"
         
-        "Q: What is GEMZ PASS?\n"
-        "A: GEMZ PASS is a collection of 555 OG NFTs offering exclusive benefits: 0% Trading Fee forever, Revenue Share from Gemz Trading Fees, Special $GEMZ Airdrop, Access to the Closed Beta, Private Gemz Trading Chat, Increased Referral Reward to 49%, and additional perks yet to be revealed.\n\n"
+        "<b>Q: What is GEMZ PASS?</b>\n"
+        f"<b>A:</b> <a href='https://getgems.io/collection/EQAZO_HuoR3aP7Pmi5kE3h91mmp4J5OwhbMcrkZlwSMVDt3M'>GEMZ PASS is a collection of 555 OG NFTs</a> offering exclusive benefits: 0% Trading Fee forever, Revenue Share from Gemz Trading Fees, Special $GEMZ Airdrop, Access to the Closed Beta, Private Gemz Trading Chat, Increased Referral Reward to 49%, and additional perks yet to be revealed.\n\n"
         
-        "Q: Are you planning to launch your own token?\n"
-        "A: Yes, we plan to launch $GEMZ, which will be traded on various exchanges. Early adopters will receive an airdrop.\n\n"
+        "<b>Q: Are you planning to launch your own token?</b>\n"
+        "<b>A:</b> Yes, we plan to launch $GEMZ, which will be traded on various exchanges. Early adopters will receive an airdrop.\n\n"
         
         "If you have any further questions you can ask them in our community👇"
     )
 
-    # Send the help text along with the support button
     send_or_edit_message(
         query,
         help_text,
         InlineKeyboardMarkup([
-            [InlineKeyboardButton("❓SUPPORT", url='https://t.me/GemzTradeCommunity/18819')],
+            [InlineKeyboardButton("❓SUPPORT", url='https://t[.]me/GemzTradeCommunity/18819'.replace("[.]", "."))],
             [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-        ])
+        ]),
+        parse_mode='HTML',
     )
 
 def send_welcome_message(entity, context: CallbackContext):
@@ -186,25 +403,50 @@ def send_welcome_message(entity, context: CallbackContext):
     Just click on the button below 👇
     """
 
-    # Determine the chat_id based on whether entity is a CallbackQuery or Message
     if isinstance(entity, CallbackQuery):
         chat_id = entity.message.chat_id
-    else:
+        message_id = entity.message.message_id
+        
+        if entity.message.photo:
+            context.bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=InputMediaPhoto(open(image_path, 'rb')),
+                reply_markup=main_menu()
+            )
+            context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=welcome_text,
+                reply_markup=main_menu()
+            )
+        else:
+            context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=welcome_text,
+                reply_markup=main_menu()
+            )
+    elif isinstance(entity, Message):
         chat_id = entity.chat_id
+        entity.reply_photo(
+            photo=open(image_path, 'rb'),
+            caption=welcome_text,
+            reply_markup=main_menu()
+        )
 
-    context.bot.send_photo(
-        chat_id=chat_id,
-        photo=open(image_path, 'rb'),
-        caption=welcome_text,
-        reply_markup=main_menu()
-    )
+async def create_and_activate_wallet_async(user_id, query):
+    address, mnemonics = await create_and_activate_wallet()
+    save_user_wallet(user_id, address, mnemonics)
+    await show_wallet_balance(query, address)
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Deposit", callback_data='deposit'), InlineKeyboardButton("Withdraw", callback_data='withdraw')],
-        [InlineKeyboardButton("Buy Token", callback_data='snipe_token'), InlineKeyboardButton("Sell Tokens", callback_data='sell_tokens')],
-        [InlineKeyboardButton("Settings", callback_data='settings'), InlineKeyboardButton("Show Seed", callback_data='show_seed')],
-        [InlineKeyboardButton("PNL", callback_data='pnl'), InlineKeyboardButton("Help", callback_data='help')]
+        [InlineKeyboardButton("💸 Wallet", callback_data='wallet')],
+        [InlineKeyboardButton("🟢 Buy", callback_data='snipe_token'), InlineKeyboardButton("🔴 Sell & Manage", callback_data='sell_tokens')],
+        [InlineKeyboardButton("🔗 Referrals", callback_data='referrals'), InlineKeyboardButton("📊 PnL", callback_data='pnl')],
+        [InlineKeyboardButton("❓ Help", callback_data='help'), InlineKeyboardButton("⚙️ Settings", callback_data='settings')],
+        [InlineKeyboardButton("🔄 Refresh", callback_data='refresh')]
     ])
 
 async def init_ton_client():
@@ -219,26 +461,12 @@ async def init_ton_client():
 async def handle_deposit(query, context):
     user_id = query.from_user.id
     wallet = get_user_wallet(user_id)
+    
     if not wallet:
         send_or_edit_message(query, "Creating and activating your wallet, this will take up to 60 seconds...")
-        address, mnemonics = await create_and_activate_wallet()
-        save_user_wallet(user_id, address, mnemonics)
-        wallet = {'address': address, 'mnemonics': mnemonics}
+        await create_and_activate_wallet_async(user_id, query)
     else:
-        address = wallet['address']
-
-    # Fetch the balance of the wallet
-    client = await init_ton_client()
-    balance = await get_wallet_balance(client, wallet['address'])
-
-    send_or_edit_message(
-        query,
-        f"💳 Please deposit TON to the following address:\n`{wallet['address']}`\n\n💰 Current Balance: {balance} TON",
-        InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-        ]),
-        parse_mode="Markdown"  # Use Markdown to make the address copyable
-    )
+        await show_wallet_balance(query, wallet['address'])
 
 async def activate_wallet(wallet):
     try:
@@ -247,6 +475,19 @@ async def activate_wallet(wallet):
     except Exception as e:
         print(f"Failed to deploy wallet: {e}")
 
+async def show_wallet_balance(query, address):
+    client = await init_ton_client()
+    balance = await get_wallet_balance(client, address)
+
+    await send_or_edit_message(
+        query,
+        f"💳 Your wallet address: `{address}`\n\n💰 Current Balance: {balance} TON",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
+        ]),
+        parse_mode="Markdown"
+    )
+    
 async def create_and_activate_wallet():
     client = TonCenterClient(base_url='https://toncenter.com/api/v2/')
     
@@ -268,18 +509,44 @@ async def create_and_activate_wallet():
 
     new_wallet_balance = await get_wallet_balance(client, new_wallet_address)
     if new_wallet_balance == 0:
-        print("Transfer not yet completed. Exiting.")
+        logger.error("Transfer not yet completed. Exiting.")
         return new_wallet_address, new_wallet_mnemonics
 
     await activate_wallet(new_wallet)
-
-    try:
-        new_wallet_state = await new_wallet.get_state()
-        print(f"New Wallet State: {new_wallet_state}")
-    except Exception as e:
-        print(f"Failed to get wallet state: {e}")
-
     return new_wallet_address, new_wallet_mnemonics
+
+def handle_referrals(query, context: CallbackContext) -> None:
+    user_id = query.from_user.id
+    
+    # Get referral data
+    c.execute("SELECT referees FROM referrals WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    
+    if result:
+        referees_count = result[0]
+        ref_link = f"t.me/GemzTradeBot?start=1007799268"
+        message_text = (
+            "Awesome! You've got your referral link 👇\n\n"
+            f"{ref_link}\n\n"
+            "Make sure to invite everyone you know. The more you invite, the more bonuses you get!\n\n"
+            "💰 Get up to 49% of your referrals fees when they start trading with GEMZ.\n\n"
+            "🏆 Earn points for each referral and get $GEMZ airdrop!\n\n"
+            f"Friends invited: {referees_count}"
+        )
+    else:
+        message_text = "❌ No referral data found."
+    
+    send_or_edit_message(
+        query,
+        message_text,
+        referral_menu()
+    )
+def token_information() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Close", callback_data='close')],
+        [InlineKeyboardButton("Buy 10 TON", callback_data='buy_10'), InlineKeyboardButton("Buy 100 TON", callback_data='buy_100')],
+        [InlineKeyboardButton("↻ Refresh", callback_data='refresh')]
+    ])
 
 def handle_withdraw(query, context):
     send_or_edit_message(
@@ -345,49 +612,20 @@ async def process_withdrawal(user_id, to_address, amount):
         logger.error(f"Error sending TON: {e}")
         return "❌ Error sending TON. Please try again later."
 
-async def handle_wallet(query, context):
-    user_id = query.from_user.id
-    wallet = get_user_wallet(user_id)
-    if wallet:
-        client = await init_ton_client()
-        balance = await get_wallet_balance(client, wallet['address'])
-        if balance is not None:
-            send_or_edit_message(
-                query,
-                f"👛 Your wallet address: <code>{wallet[address]}</code>\nBalance: {balance} TON",
-                InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')],
-                    [InlineKeyboardButton("Show Seed", callback_data='show_seed')]
-                ]),
-                parse_mode="HTML"  # Ensure Markdown is used for formatting
-            )
-        else:
-            send_or_edit_message(
-                query,
-                "❌ Could not fetch balance. Please try again later.",
-                InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')],
-                    [InlineKeyboardButton("Show Seed", callback_data='show_seed')]
-                ])
-            )
-    else:
-        send_or_edit_message(
-            query,
-            "❌ No wallet found for your account. Please create a wallet first.",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-            ])
-        )
-        
 async def get_wallet_balance(client, address):
     try:
+        logger.info(f"Получение баланса для адреса: {address}")
         client1 = TonCenterClient(base_url='https://toncenter.com/api/v2/')
-
         wallet = Wallet(provider=client1, address=address)
+        
         balance = await wallet.get_balance()
-        return balance / 10**9  # Convert from nanoTON to TON
+        logger.info(f"Баланс получен: {balance}")
+        
+        balance_ton = balance / 10**9
+        logger.info(f"Баланс в TON: {balance_ton}")
+        return balance_ton
     except Exception as e:
-        print(f"Failed to get balance: {e}")
+        logger.error(f"Ошибка при получении баланса: {e}")
         return 0
 
 async def create_state_init_jetton(user_id):
@@ -551,8 +789,8 @@ def handle_settings(query, context):
     settings = get_settings_from_database(user_id)
     settings_text = (
         f"⚙️ Current settings:\n"
-        f"💧 Liquidity Amount: {settings['liquidity_amount']}\n"
-        f"💸 MCAP Amount: {settings['mcap_amount']}\n"
+        # f"💧 Liquidity Amount: {settings['liquidity_amount']}\n"
+        # f"💸 MCAP Amount: {settings['mcap_amount']}\n"
         f"⚖️ Slippage Percent: {settings['slippage_percent']}\n"
     )
     logger.info(f"Settings for user {user_id}: {settings_text}")
@@ -560,7 +798,12 @@ def handle_settings(query, context):
 
 def handle_set_setting_start(query, context, setting_name) -> None:
     context.user_data['current_setting'] = setting_name
-    context.user_data['current_setting_step'] = 'awaiting_value'
+    context.user_data['next_action'] = 'setting_value'
+    logger.info(f"Set next_action to 'setting_value' for setting {setting_name}")
+
+    # Явно сохраняем контекст
+    context.user_data['preserve'] = True  # Добавляем маркер сохранения
+    
     send_or_edit_message(
         query,
         f"🔧 Please enter the value for {setting_name}:",
@@ -569,6 +812,7 @@ def handle_set_setting_start(query, context, setting_name) -> None:
         ])
     )
 
+    
 def handle_setting_value(update: Update, context: CallbackContext) -> None:
     user_id = update.message.from_user.id
     setting_name = context.user_data.get('current_setting')
@@ -585,10 +829,10 @@ def handle_setting_value(update: Update, context: CallbackContext) -> None:
 
     save_setting(user_id, setting_name, value)
     
-    # Clear the context after setting is updated
+    # После сохранения настройки сбрасываем контекст
     context.user_data['current_setting'] = None
     context.user_data['current_setting_step'] = None
-    context.user_data['next_action'] = None  # Clear any other pending actions
+    context.user_data['next_action'] = None  # Сбрасываем next_action
 
     update.message.reply_text(f"{setting_name.replace('_', ' ').title()} set to {value}.",
                               reply_markup=settings_menu())
@@ -617,22 +861,6 @@ def handle_token_parameter_value(update: Update, context: CallbackContext) -> No
 
     update.message.reply_text(f"{parameter.replace('_', ' ').title()} set to {value}.")
 
-# def handle_socials(query, context):
-#     social_text = (
-#         "🌐 Follow us on:\n"
-#         "Telegram: [WTF on TON](https://t.me/WTF_on_ton)\n"
-#         "Twitter: [WTF ON TON](https://x.com/WTF_ON_TON)\n"
-#         "Website: [tonwtf.xyz](https://tonwtf.xyz/)"
-#     )
-#     send_or_edit_message(
-#         query,
-#         social_text,
-#         InlineKeyboardMarkup([
-#             [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-#         ]),
-#         parse_mode='Markdown'
-#     )
-
 def handle_token_mint(query, context):
     send_or_edit_message(
         query,
@@ -653,8 +881,14 @@ def handle_message(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     next_action = context.user_data.get('next_action')
 
-    if next_action == 'sell_token_amount':
-        handle_sell_token_amount(update, context)  # Запуск процесса продажи
+    logger.info(f"Received message: {update.message.text}")
+    logger.info(f"Next action: {next_action}")
+    logger.info(f"Context at handle_message start: {context.user_data}")
+
+    if next_action == 'setting_value':
+        handle_setting_value(update, context)
+    elif next_action == 'sell_token_amount':
+        handle_sell_token_amount(update, context)
     elif next_action == 'withdraw_address' or next_action == 'withdraw_amount':
         handle_withdraw_amount(update, context)
     elif next_action == 'snipe_token_address':
@@ -663,6 +897,8 @@ def handle_message(update: Update, context: CallbackContext):
         handle_snipe_token_amount(update, context)
     else:
         update.message.reply_text("Unrecognized command or input. Please use the menu.")
+
+
 
 def get_user_wallet(user_id):
     c.execute("SELECT address, seed FROM user_wallets WHERE user_id=?", (user_id,))
@@ -719,7 +955,6 @@ def save_token_param(user_id, param_name, value):
 def get_ton_token_pool(token_address):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
     
-
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -824,7 +1059,6 @@ async def snipe_token(user_id, token_address, offer_amount, message):
             logger.error(f"An unexpected error occurred during sniping: {e}")
             send_or_edit_message(message, f"❌ An unexpected error occurred: {e}.")
             
-
 def cancel_snipe(update: Update, context: CallbackContext):
     query = update.callback_query
     user_id = query.from_user.id
@@ -840,7 +1074,7 @@ def handle_snipe_token_start(query, context):
     send_or_edit_message(
         query,
         "Please enter the token address:",
-        reply_markup=InlineKeyboardMarkup([
+        InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
         ])
     )
@@ -851,27 +1085,24 @@ def handle_snipe_token_address(update: Update, context: CallbackContext):
     token_address = update.message.text
     context.user_data['snipe_token_address'] = token_address
 
-    # Fetch pool information
     pool_info = get_ton_token_pool(token_address)
     if pool_info:
         base_token_name, quote_token_name, pool_address, fdv_usd, reserve_in_usd, base_token_price_quote_token = pool_info
         token_info_message = (
-            f"🔍 **Token Information:**\n"
-            f"🪙 **Base Token Name:** {base_token_name}\n"
-            f"💱 **Quote Token Name:** {quote_token_name}\n"
-            f"📍 **Pool Address:** `{pool_address}`\n"
-            f"💵 **Fully Diluted Valuation (FDV) USD:** ${fdv_usd}\n"
-            f"💧 **Liquidity in USD:** ${reserve_in_usd}\n"
-            f"💰 **Base Token Price in Quote Token:** {base_token_price_quote_token}\n\n"
+            "<b>Token Information</b>\n\n"
+            f"🔍 <b>Name:</b> {base_token_name}\n"
+            f"📍 <b>Pool Address:</b> {pool_address}\n"
+            f"💵 <b>Fully Diluted Valuation:</b> {fdv_usd}\n"
+            f"💰 <b>Market Cap:</b> {reserve_in_usd}\n"
+            f"💧 <b>Liquidity:</b> {reserve_in_usd}\n"
+            f"🪙 <b>Price in TON:</b> {base_token_price_quote_token}\n\n"
             "Please enter the amount you want to buy:"
         )
         context.user_data['next_action'] = 'snipe_token_amount'
         update.message.reply_text(
             token_info_message,
-            parse_mode="Markdown",  # Use Markdown to format the message nicely
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-            ])
+            parse_mode="HTML",
+            reply_markup=token_information_menu()  # Здесь вставляем кнопки
         )
     else:
         update.message.reply_text(
@@ -880,31 +1111,7 @@ def handle_snipe_token_address(update: Update, context: CallbackContext):
                 [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
             ])
         )
-async def get_user_tokens(wallet_address):
-    url = f"https://tonapi.io/v2/accounts/{wallet_address}/jettons?currencies=ton,usd,rub"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Поднять исключение для любых HTTP ошибок
-        data = response.json()
 
-        # Логирование для отладки
-        logger.info(f"Received data: {data}")
-
-        if "balances" in data:
-            return data["balances"]
-        else:
-            return []
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error occurred: {e}")
-        return []
-    except ValueError as e:
-        # Это поймает ошибку, если JSON не удалось распарсить
-        logger.error(f"Error parsing JSON response: {e}")
-        logger.error(f"Raw response content: {response.text}")  # Логируем сырое содержимое ответа
-        return []
-    except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
-        return []
 def handle_snipe_token_amount(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     amount = update.message.text
@@ -926,9 +1133,25 @@ def handle_snipe_token_amount(update: Update, context: CallbackContext):
 
     thread = threading.Thread(target=run_snipe_task)
     thread.start()
+def send_or_edit_message(entity, text, reply_markup=None, parse_mode=None):
+    try:
+        if isinstance(entity, CallbackQuery):
+            # Проверяем, существует ли сообщение и содержит ли оно текст
+            if entity.message and entity.message.text:
+                entity.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            else:
+                entity.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        elif isinstance(entity, Message):
+            entity.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        logger.error(f"BadRequest error: {e.message}")
+def referral_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Close", callback_data='close'), InlineKeyboardButton("↻ Refresh", callback_data='refresh')],
+        [InlineKeyboardButton("🔗 Invite", callback_data='invite')]
+    ])
 
-# Функция для создания кнопок с сокращенными данными и сохранением полного адреса в context.user_data
-def handle_sell_tokens_start(query, context):
+def handle_sell_tokens_start(query, context: CallbackContext):
     user_id = query.from_user.id
     wallet = get_user_wallet(user_id)
     
@@ -943,75 +1166,78 @@ def handle_sell_tokens_start(query, context):
         return
 
     wallet_address = wallet['address']
-    
-    # Fetching tokens
-    async def fetch_and_show_tokens():
-        tokens = await get_user_tokens(wallet_address)
+    asyncio.run(fetch_and_show_tokens(query, context, wallet_address))
 
-        if not tokens:
-            send_or_edit_message(
-                query,
-                "⚠️ No tokens found in your wallet.",
-                InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-                ])
-            )
-            return
+async def fetch_and_show_tokens(query, context, wallet_address):
+    tokens = await get_user_tokens(wallet_address)
 
-        # Формируем сообщение с токенами и их балансами
-        token_buttons = []
-        for i, token in enumerate(tokens):
-            token_address = token['jetton']['address']
-            token_name = token.get('jetton', {}).get('name', 'Unknown Token')
-            token_balance = token.get('balance', 0)
-            token_symbol = token.get('jetton', {}).get('symbol', 'N/A')
-
-            # Сохраняем полный адрес в context.user_data
-            context.user_data[f'token_address_{i}'] = token_address
-
-            # В callback_data передаем индекс токена вместо полного адреса
-            token_buttons.append([
-                InlineKeyboardButton(f"{token_name} ({token_symbol}) - {token_balance}",
-                                     callback_data=f'sell_token_{i}')
-            ])
-
-        token_buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')])
-
+    if not tokens:
         send_or_edit_message(
             query,
-            "💰 Select a token to sell:",
-            InlineKeyboardMarkup(token_buttons)
-        )
-
-    # Запускаем асинхронный процесс получения токенов
-    asyncio.run(fetch_and_show_tokens())
-
-def handle_token_selection(query, context):
-    user_id = query.from_user.id
-
-    # Извлекаем индекс токена из callback_data
-    token_index = int(query.data.split('sell_token_')[-1])
-
-    # Получаем полный адрес токена из context.user_data
-    token_address = context.user_data.get(f'token_address_{token_index}')
-    if not token_address:
-        logger.error("Token address not found in context.user_data")
-        send_or_edit_message(
-            query,
-            "❌ An error occurred: Token address not found.",
+            "⚠️ No tokens found in your wallet.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
             ])
         )
         return
 
-    # Преобразуем адрес в пользовательский формат
+    token_buttons = []
+    for i, token in enumerate(tokens):
+        token_address = token['jetton']['address']
+        token_name = token.get('jetton', {}).get('name', 'Unknown Token')
+        token_balance = token.get('balance', 0)
+        token_symbol = token.get('jetton', {}).get('symbol', 'N/A')
+
+        token_balance_formatted = "{:.2f}".format(float(token_balance) / 10**9)
+
+        context.user_data[f'token_address_{i}'] = token_address
+
+        token_buttons.append([
+            InlineKeyboardButton(f"{token_name} ({token_symbol}) - {token_balance_formatted}",
+                                 callback_data=f'sell_token_{i}')
+        ])
+
+    token_buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')])
+
+    send_or_edit_message(
+        query,
+        "💰 Select a token to sell:",
+        InlineKeyboardMarkup(token_buttons)
+    )
+
+    asyncio.run(fetch_and_show_tokens())
+
+def handle_token_selection(query, context):
+    user_id = query.from_user.id
+
+    token_index = int(query.data.split('sell_token_')[-1])
+
+    token_address = context.user_data.get(f'token_address_{token_index}')
+    if not token_address:
+        logger.error("Token address not found in context.user_data")
+        query.message.reply_text(
+            "❌ An error occurred: Token address not found.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
+            ])
+        )
+        return
+
     token_address = convert_to_user_friendly_format(token_address)
 
     context.user_data['sell_token_address'] = token_address
     logger.info(f"Token address selected: {token_address}")
 
-    # Далее вызывается функция для получения баланса
+    # Отправляем новое сообщение с запросом на ввод суммы, не убирая меню токенов
+    query.message.reply_text(
+        f"Please enter the amount you want to sell for token: {token_address}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
+        ])
+    )
+
+    context.user_data['next_action'] = 'sell_token_amount'
+
     async def fetch_balance():
         try:
             wallet_address = context.user_data.get('wallet_address')
@@ -1019,7 +1245,7 @@ def handle_token_selection(query, context):
             context.user_data['token_balance'] = token_balance
             send_or_edit_message(
                 query,
-                f"💰 Your token balance: {token_balance} tokens.\nPlease enter the amount you want to sell:",
+                f"Please enter the amount you want to sell:",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
                 ])
@@ -1030,53 +1256,6 @@ def handle_token_selection(query, context):
             
     asyncio.run(fetch_balance())
     context.user_data['next_action'] = 'sell_token_amount'
-
-def handle_sell_token_address(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    token_address = update.message.text
-    context.user_data['sell_token_address'] = token_address
-    context.user_data['next_action'] = None  # Clear next_action to prevent loop
-    update.message.reply_text(
-        "🔄 Fetching token balance...",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Buy Menu", callback_data='sniping')]
-        ])
-    )
-
-    def run_fetch_balance():
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(fetch_token_balance(update, context, user_id, token_address))
-        loop.close()
-
-    threading.Thread(target=run_fetch_balance).start()
-
-
-async def fetch_token_balance(update: Update, context: CallbackContext, user_id, token_address):
-    logger.info(f"Fetching token balance for user_id: {user_id}, token_address: {token_address}")
-
-    wallet = get_user_wallet(user_id)
-    if not wallet:
-        logger.error("No wallet found for the user.")
-        update.message.reply_text("❌ No wallet found for your account. Please create a wallet first.")
-        return
-
-    wallet_address = wallet['address']
-    logger.info(f"User's wallet address: {wallet_address}")
-
-    token_balance = await get_token_balance(wallet_address, token_address)
-    logger.info(f"Fetched token balance: {token_balance}")
-
-    context.user_data['token_balance'] = token_balance
-
-    update.message.reply_text(
-        f"💰 Your token balance: {token_balance} tokens.\nEnter the amount you want to sell:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Sniping Menu", callback_data='sniping')]
-        ])
-    )
-    context.user_data['next_action'] = 'sell_token_amount'  # Set next_action here after fetching balance
-
 
 def handle_sell_token_amount(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
@@ -1089,20 +1268,10 @@ def handle_sell_token_amount(update: Update, context: CallbackContext):
         update.message.reply_text("❌ Please enter a valid number.")
         return
 
-    token_balance = context.user_data.get('token_balance')
-    if token_balance is None:
-        update.message.reply_text("❌ Unable to retrieve token balance. Please try again.")
-        return
-
-    logger.info(f"Current token balance: {token_balance}")
-
-    # if amount > token_balance:
-    #     update.message.reply_text("❌ Insufficient token balance.")
-    #     return
-
     token_address = context.user_data['sell_token_address']
     update.message.reply_text("🚀 Selling tokens...")
 
+    # Запуск процесса продажи токенов
     def run_sell_task():
         asyncio.set_event_loop(asyncio.new_event_loop())
         loop = asyncio.get_event_loop()
@@ -1116,7 +1285,6 @@ async def get_token_balance(wallet_address, token_address):
         provider = LiteBalancer.from_mainnet_config(2)
         await provider.start_up()
 
-        # Retrieve the address of the user's token wallet
         result_stack = await provider.run_get_method(
             address=token_address,
             method="get_wallet_address",
@@ -1125,7 +1293,6 @@ async def get_token_balance(wallet_address, token_address):
         token_wallet_address = result_stack[0].load_address()
         logger.info(f"Token wallet address for {wallet_address}: {token_wallet_address}")
 
-        # Query the token balance
         result_stack = await provider.run_get_method(
             address=token_wallet_address,
             method="get_wallet_data",
@@ -1135,24 +1302,17 @@ async def get_token_balance(wallet_address, token_address):
         logger.info(f"Token balance: {balance}")
 
         await provider.close_all()
-        return balance / 10**9  # Assuming the balance is in nanoton and converting to ton
+        return balance / 10**9
     except Exception as e:
         logger.error(f"An error occurred: {e}")
         return 0.0
 
-import asyncio
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 async def sell_tokens(user_id, token_address, amount, message):
-    # Конвертируем адрес токена в user-friendly формат
     converted_token_address = convert_to_user_friendly_format(token_address)
     
-    mnemonics = get_user_mnemonics(user_id)  # Функция для получения мнемоник фразы пользователя из базы данных
+    mnemonics = get_user_mnemonics(user_id)
     if not mnemonics:
-        await message.reply_text("❌ No wallet found for your account. Please create a wallet first.")
+        message.reply_text("❌ No wallet found for your account. Please create a wallet first.")
         return
 
     jetton_sell_address = AddressV1(converted_token_address)
@@ -1171,14 +1331,15 @@ async def sell_tokens(user_id, token_address, amount, message):
         )
 
         await wallet.transfer(destination=params['to'],
-                              amount=int(0.35 * 1e9),  # Gas_amount
+                              amount=int(0.35 * 1e9),
                               body=params['payload'])
         await provider.close_all()
 
-        await message.reply_text(f"✅ Successfully sold {amount} tokens.")
+        message.reply_text(f"✅ Successfully sold {amount} tokens.")
     except Exception as e:
         logger.error(f"An error occurred during the token sale: {e}")
-        await message.reply_text(f"❌ An error occurred: {str(e)}")
+        message.reply_text(f"❌ An error occurred: {str(e)}")
+
 
 def get_user_mnemonics(user_id):
     c.execute("SELECT seed FROM user_wallets WHERE user_id=?", (user_id,))
@@ -1202,23 +1363,19 @@ def show_seed_phrase(query, context):
         message_text = (
             "You can now import your wallet, for example into Tonkeeper, using this seed phrase. "
             "Delete this message once you are done.\n\n"
-            f"🔑 Your seed phrase: <code>{seed_phrase}</code>"  # Use <code> tags for HTML formatting
+            f"🔑 Your seed phrase: <code>{seed_phrase}</code>"
         )
         send_or_edit_message(
             query,
             message_text,
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-            ]),
-            parse_mode="HTML"  # Ensure HTML is used for formatting
+            wallet_menu(),
+            parse_mode="HTML"
         )
     else:
         send_or_edit_message(
             query,
             "❌ No wallet found for your account. Please create a wallet first.",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main')]
-            ])
+            wallet_menu()
         )
 
 def main():
