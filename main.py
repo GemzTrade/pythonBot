@@ -324,7 +324,7 @@ def handle_callback_query(update: Update, context: CallbackContext) -> None:
         if query.data == 'wallet_withdraw':
             asyncio.run(handle_wallet_withdraw(query, context))
         elif query.data == 'wallet_deposit':
-            asyncio.run(handle_wallet_deposit(query, context)) 
+            handle_wallet_deposit(query, context)
         elif query.data == 'wallet_show_seed':
             handle_wallet_show_seed(query, context)  
         elif query.data == 'delete_message':
@@ -578,8 +578,57 @@ def handle_wallet(query, context):
                 "❌ No wallet found for your account. Please create a wallet first.",
                 reply_markup=wallet_menu("")  # Передача пустого адреса
             )
-async def handle_wallet_deposit(query, context):
-    await handle_deposit(query, context)
+
+def wallet_deposit_menu(user_wallet_address):
+    """Menu for wallet deposit via Telegram Wallet."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data='wallet'),
+            InlineKeyboardButton("Home", callback_data='back_to_main')
+        ],
+        [InlineKeyboardButton("Deposit Via Wallet", url=f'https://t.me/wallet?start={user_wallet_address}')]
+    ])
+
+def handle_wallet_deposit(query, context):
+    """Handles the wallet deposit action."""
+    user_id = query.from_user.id
+    user_wallet = get_user_wallet(user_id)
+
+    if not user_wallet:
+        send_or_edit_message(query, "❌ No wallet found. Please create a wallet first.")
+        return
+
+    deposit_message = (
+        f"Send TON to the address below or tap the button to deposit through Telegram Wallet.\n\n"
+        f"💳 <b>Address:</b> `{user_wallet['address']}`"
+    )
+
+    send_or_edit_message(
+        query,
+        deposit_message,
+        wallet_deposit_menu(user_wallet['address']),
+        parse_mode='HTML'
+    )
+
+def handle_back_to_wallet(query, context):
+    """Returns to the wallet menu."""
+    user_id = query.from_user.id
+    user_wallet = get_user_wallet(user_id)
+
+    if user_wallet:
+        query.edit_message_text(
+            text=f"💳 Your wallet address: `{user_wallet['address']}`\n\n💰 Current Balance: 0 TON",
+            reply_markup=wallet_menu(user_wallet['address']),
+            parse_mode='Markdown'
+        )
+    else:
+        query.edit_message_text(
+            text="❌ No wallet found. Please create a wallet first.",
+            reply_markup=wallet_menu()
+        )
+def handle_back_to_main(query, context):
+    """Returns to the main menu."""
+    send_welcome_message(query, context)        
 
 async def handle_wallet_withdraw(query, context):
     await handle_withdraw(query, context)
