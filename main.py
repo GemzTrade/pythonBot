@@ -476,26 +476,34 @@ def display_token_information(query, context: CallbackContext):
         parse_mode="HTML"
     )
 
-def display_transaction_sent(query, context, amount, token):
+def display_transaction_sent(message, context, amount, token):
     transaction_sent_text = (
         "<b>Buy Transaction Sent</b>\n\n"
         "💰 <b>Amount:</b> {amount} TON\n"
         "🪙 <b>Token:</b> {token}\n\n"
         "Waiting for confirmation..."
     ).format(amount=amount, token=token)
-    
+
     keyboard = [
         [InlineKeyboardButton("← Home", callback_data='back_to_main')]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        text=transaction_sent_text,
-        reply_markup=reply_markup,
-        parse_mode="HTML"
-    )
 
+    if isinstance(message, CallbackQuery):
+        # Если объект - это CallbackQuery, то используй edit_message_text
+        message.edit_message_text(
+            text=transaction_sent_text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+    elif isinstance(message, Message):
+        # Если это обычное сообщение, используй reply_text
+        message.reply_text(
+            text=transaction_sent_text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
 def display_transaction_success(query, context, amount, token, entry_price):
     transaction_success_text = (
         "<b>Swap Successful!</b>\n\n"
