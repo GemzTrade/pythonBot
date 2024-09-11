@@ -29,6 +29,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 
 
+
 executor = ThreadPoolExecutor()
 
 router = RouterV1()
@@ -2050,7 +2051,6 @@ async def sell_tokens(user_id, token_address, amount, message, context):
         await provider.close_all()
 
         message.reply_text("🚀 Transaction sent successfully! Waiting for confirmation…")
-        save_trade(user_id, token_address, 'sell', amount, base_token_price_quote_token)
         await monitor_transaction_completion(user_id, context, message, "sell", initial_balances)
 
     except Exception as e:

@@ -1,0 +1,50 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ton-bot-deployment
+  labels:
+    app: ton-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ton-bot
+  template:
+    metadata:
+      labels:
+        app: ton-bot
+    spec:
+      containers:
+      - name: ton-bot
+        image: docker:latest  
+        ports:
+        - containerPort: 80
+        env:
+        - name: TELEGRAM_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ton-bot-secret
+              key: telegram-token
+        - name: DATABASE_URL
+          value: "sqlite:///userwallets.db"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ton-bot-secret
+type: Opaque
+data:
+  telegram-token: base64-encoded-token 
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ton-bot-service
+spec:
+  selector:
+    app: ton-bot
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
