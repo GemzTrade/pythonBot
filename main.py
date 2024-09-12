@@ -2057,6 +2057,44 @@ async def sell_tokens(user_id, token_address, amount, message, context):
         logger.error(f"An unexpected error occurred during token sale: {e}")
         send_or_edit_message(message, "❌ An unexpected error occurred. Please try again.")
         send_welcome_message(message, context)
+async def buy_token(user_id, token_address, offer_amount, context, message):
+    try:
+        wallet_info = await get_user_wallet(user_id)
+        if not wallet_info:
+            await context.bot.send_message(chat_id=message.chat_id, text="❌ Кошелек не найден. Создайте кошелек сначала.")
+            return
+        
+        client = await init_ton_client()
+        provider = LiteBalancer.from_mainnet_config(2)
+        await provider.start_up()
+        
+        wallet = await WalletV4R2.from_mnemonic(provider=provider, mnemonics=wallet_info['mnemonics'])
+        
+        router = RouterV1()
+        params = await router.build_swap_ton_to_jetton_tx_params(
+            user_wallet_address=wallet.address,
+            ask_jetton_address=AddressV1(token_address),
+            offer_amount=int(offer_amount * 1e9), 
+            min_ask_amount=int(offer_amount * 1e9 * 0.9),  
+            provider=provider
+        )
+        
+        transaction = await wallet.transfer(
+            destination=params['to'],
+            amount=params['amount'],
+            body=params['payload']
+        )
+
+        if transaction:
+            await context.bot.send_message(chat_id=message.chat_id, text=f"✅ Покупка {offer_amount} токенов успешно выполнена!")
+        else:
+            await context.bot.send_message(chat_id=message.chat_id, text="❌ Ошибка при покупке токенов. Попробуйте позже.")
+        
+        await provider.close_all()
+
+    except Exception as e:
+        logger.error(f"Ошибка при покупке токенов: {e}")
+        await context.bot.send_message(chat_id=message.chat_id, text="❌ Ошибка при покупке токенов. Попробуйте позже.")        
 def display_position_pnl_menu(query, context, wallet_address):
     tokens = asyncio.run(get_user_tokens(wallet_address))
     
@@ -2105,7 +2143,72 @@ def get_user_wallet(user_id):
     if result:
         return {'address': result[0], 'mnemonics': result[1].split()}
     return None
+async def sell_token(user_id, token_address, sell_amount, context, message):
+    try:
+        # Получаем информацию о кошельке пользователя
+        wallet_info = await get_user_wallet(user_id)
+        if not wallet_info:
+            await context.bot.send_message(chat_id=message.chat_id, text="❌ Кошелек не найден. Создайте кошелек сначала.")
+            return
 
+        # Инициализация клиента TON и кошелька
+        client = await init_ton_client()
+        provider = LiteBalancer.from_mainnet_config(2)
+        await provider.start_up()
+
+        wallet = await WalletV4R2.from_mnemonic(provider=provider, mnemonics=wallet_info['mnemonics'])
+
+        router = RouterV1()
+        params = await router.build_swap_jetton_to_ton_tx_params(
+            user_wallet_address=wallet.address,
+            offer_jetton_address=AddressV1(token_address),
+            offer_amount=int(sell_amount * 1e9),  
+            min_ask_amount=int(sell_amount * 1e9 * 0.9),  
+            provider=provider
+        )
+
+        transaction = await wallet.transfer(
+            destination=params['to'],
+            amount=int(0.35 * 1e9),  
+            body=params['payload']
+        )
+
+        if transaction:
+            await context.bot.send_message(chat_id=message.chat_id, text=f"✅ Продажа {sell_amount} токенов успешно выполнена!")
+        else:
+            await context.bot.send_message(chat_id=message.chat_id, text="❌ Ошибка при продаже токенов. Попробуйте позже.")
+        
+        await provider.close_all()
+
+    except Exception as e:
+        logger.error(f"Ошибка при продаже токенов: {e}")
+        await context.bot.send_message(chat_id=message.chat_id, text="❌ Ошибка при продаже токенов. Попробуйте позже.")    
+async def delete_previous_message(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    
+    message_ids = context.user_data.get('message_history', [])
+
+    if len(message_ids) >= 2:
+        message_to_delete_id = message_ids[-2] 
+        
+        try:
+            await context.bot.delete_message(chat_id=update.message.chat_id, message_id=message_to_delete_id)
+            await update.message.reply_text(f"Сообщение с ID {message_to_delete_id} удалено.")
+        except BadRequest as e:
+            logger.error(f"Ошибка удаления сообщения: {e}")
+            await update.message.reply_text(f"Ошибка удаления сообщения с ID {message_to_delete_id}.")
+    else:
+        await update.message.reply_text("Недостаточно сообщений для удаления пред-предыдущего.")
+
+async def store_message_id(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+
+    message_ids = context.user_data.get('message_history', [])
+    message_ids.append(update.message.message_id)
+
+    context.user_data['message_history'] = message_ids[-5:]
+
+    await update.message.reply_text(f"Ваше сообщение сохранено с ID {update.message.message_id}.")
 def show_seed_phrase(query, context):
     user_id = query.from_user.id
     wallet = get_user_wallet(user_id)
